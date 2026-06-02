@@ -19,6 +19,8 @@ const (
 	TypeIPMI         = "ipmi"
 	TypeResult       = "result"
 	TypeCapabilities = "capabilities"
+	TypeS3Telemetry  = "s3_telemetry"
+	TypeS3Health     = "s3_health"
 )
 
 // Result status constants — used in ResultPayload.Status.
@@ -90,7 +92,7 @@ type CapabilitiesPayload struct {
 }
 
 // New returns a new Envelope with a generated UUID v4 ID and current timestamp.
-func New(agentUUID, msgType string, payload any) (Envelope, error) {
+func New(agentUUID, agentType, msgType string, payload any) (Envelope, error) {
 	raw, err := json.Marshal(payload)
 	if err != nil {
 		return Envelope{}, fmt.Errorf("marshalling payload: %w", err)
@@ -99,7 +101,7 @@ func New(agentUUID, msgType string, payload any) (Envelope, error) {
 		V:         1,
 		ID:        newUUID(),
 		Type:      msgType,
-		AgentType: "vm",
+		AgentType: agentType,
 		AgentUUID: agentUUID,
 		Timestamp: time.Now().Unix(),
 		Payload:   raw,
@@ -112,8 +114,9 @@ func (e *Envelope) DecodePayload(dst any) error {
 }
 
 // ResultFor constructs a result Envelope that echoes back the command ID from src.
-func ResultFor(src Envelope, agentUUID, status, message string, output any) (Envelope, error) {
-	return New(agentUUID, TypeResult, ResultPayload{
+// agentType should match the agent's configured type (e.g. "storage").
+func ResultFor(src Envelope, agentUUID, agentType, status, message string, output any) (Envelope, error) {
+	return New(agentUUID, agentType, TypeResult, ResultPayload{
 		CommandID: src.ID,
 		Status:    status,
 		Message:   message,

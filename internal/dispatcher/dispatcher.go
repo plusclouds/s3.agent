@@ -17,6 +17,7 @@ import (
 	"go.uber.org/zap"
 
 	"github.com/plusclouds/ubuntu-agent/internal/executor"
+	s3module "github.com/plusclouds/ubuntu-agent/internal/modules/s3"
 	"github.com/plusclouds/ubuntu-agent/internal/modules/services"
 	"github.com/plusclouds/ubuntu-agent/internal/modules/system"
 	"github.com/plusclouds/ubuntu-agent/internal/protocol"
@@ -28,20 +29,29 @@ type Dispatcher struct {
 	sys             *system.Module
 	svc             services.Manager
 	exec            *executor.Executor
+	s3mgr           *s3module.Manager
+	s3obs           *s3module.Observer
 	pub             *publisher.Publisher
 	allowedOps      map[string]bool
 	allowedCommands []string
 	agentUUID       string
+	agentType       string
 	logger          *zap.Logger
+
+	// lastDesired holds the most recent full_sync payload for use by reconcile.
+	lastDesired *s3module.FullSyncPayload
 }
 
-// New creates a Dispatcher. allowedOps and allowedCommands come from agent config.
+// New creates a Dispatcher.
 func New(
 	sys *system.Module,
 	svc services.Manager,
 	exec *executor.Executor,
+	s3mgr *s3module.Manager,
+	s3obs *s3module.Observer,
 	pub *publisher.Publisher,
 	agentUUID string,
+	agentType string,
 	allowedOps []string,
 	allowedCommands []string,
 	logger *zap.Logger,
@@ -54,20 +64,42 @@ func New(
 		sys:             sys,
 		svc:             svc,
 		exec:            exec,
+		s3mgr:           s3mgr,
+		s3obs:           s3obs,
 		pub:             pub,
 		allowedOps:      ops,
 		allowedCommands: allowedCommands,
 		agentUUID:       agentUUID,
+		agentType:       agentType,
 		logger:          logger,
 	}
 }
 
 // params is the common command params shape. Fields are optional depending on operation.
 type params struct {
-	Name       string   `json:"name"`
-	Command    string   `json:"command"`
-	Args       []string `json:"args"`
-	IntervalS  int      `json:"interval_s"`
+	// Generic
+	Name      string   `json:"name"`
+	Command   string   `json:"command"`
+	Args      []string `json:"args"`
+	IntervalS int      `json:"interval_s"`
+
+	// S3 bucket
+	BucketID          string                  `json:"bucket_id"`
+	OwnerTenantID     string                  `json:"owner_tenant_id"`
+	ReplicationFactor int                     `json:"replication_factor"`
+	LifecycleRules    []s3module.LifecycleRule `json:"lifecycle_rules"`
+	ForceEmpty        bool                    `json:"force_empty"`
+
+	// S3 IAM
+	AccessKey  string            `json:"access_key"`
+	SecretKey  string            `json:"secret_key"`
+	BucketACLs []s3module.BucketACL `json:"bucket_acls"`
+
+	// Nginx blocking
+	Reason string `json:"reason"`
+
+	// Reconcile scope
+	Scope string `json:"scope"`
 }
 
 // Dispatch handles a single command envelope and returns the result envelope.
@@ -99,6 +131,20 @@ func (d *Dispatcher) Dispatch(ctx context.Context, env protocol.Envelope) protoc
 	if !d.allowedOps[op] {
 		result := d.reject(env, fmt.Sprintf("operation %q is not permitted on this agent", op))
 		d.logResult(env.ID, op, protocol.StatusRejected, "operation not in allowed_operations", time.Since(start))
+		return result
+	}
+
+	// full_sync uses the raw params directly as its payload; other ops use the
+	// standard params struct.
+	if op == "full_sync" {
+		output, err := d.runFullSync(ctx, cmd.Params)
+		if err != nil {
+			result := d.fail(env, err.Error())
+			d.logResult(env.ID, op, protocol.StatusFailed, err.Error(), time.Since(start))
+			return result
+		}
+		result := d.ok(env, output)
+		d.logResult(env.ID, op, protocol.StatusCompleted, "", time.Since(start))
 		return result
 	}
 
@@ -149,9 +195,21 @@ func (d *Dispatcher) logResult(commandID, op, status, msg string, elapsed time.D
 	}
 }
 
+// runFullSync handles the full_sync operation separately because its params
+// are decoded directly as FullSyncPayload rather than the generic params struct.
+func (d *Dispatcher) runFullSync(ctx context.Context, raw json.RawMessage) (any, error) {
+	var payload s3module.FullSyncPayload
+	if err := json.Unmarshal(raw, &payload); err != nil {
+		return nil, fmt.Errorf("decoding full_sync payload: %w", err)
+	}
+	d.lastDesired = &payload
+	return d.s3mgr.Reconcile(ctx, payload)
+}
+
 // run executes the operation and returns the output or an error.
 func (d *Dispatcher) run(ctx context.Context, op string, p params) (any, error) {
 	switch op {
+
 	// ---- system -------------------------------------------------------
 	case "system.info":
 		return d.sys.GetInfo(ctx)
@@ -194,6 +252,7 @@ func (d *Dispatcher) run(ctx context.Context, op string, p params) (any, error) 
 			stdout, stderr, execErr = d.exec.Execute(ctx, "systemctl", "reboot")
 		}
 		return map[string]string{"stdout": stdout, "stderr": stderr}, execErr
+
 	case "vm.shutdown":
 		var stdout, stderr string
 		var execErr error
@@ -211,30 +270,21 @@ func (d *Dispatcher) run(ctx context.Context, op string, p params) (any, error) 
 			return nil, fmt.Errorf("could not detect OS: %w", err)
 		}
 		if distro == "" {
-			return nil, fmt.Errorf("system.update is only supported on Ubuntu/Debian; detected OS is not apt-based")
+			return nil, fmt.Errorf("system.update is only supported on Ubuntu/Debian")
 		}
-
-		// Run apt-get update first, then upgrade. Stop on first failure.
 		updateOut, updateErr, err := d.exec.Execute(ctx,
 			"apt-get", "-y", "-o", "Dpkg::Options::=--force-confdef",
 			"-o", "Dpkg::Options::=--force-confold", "update")
 		if err != nil {
-			return map[string]any{
-				"step":   "apt-get update",
-				"stdout": updateOut,
-				"stderr": updateErr,
-			}, fmt.Errorf("apt-get update failed: %w", err)
+			return map[string]any{"step": "apt-get update", "stdout": updateOut, "stderr": updateErr},
+				fmt.Errorf("apt-get update failed: %w", err)
 		}
-
 		upgradeOut, upgradeErr, err := d.exec.Execute(ctx,
 			"apt-get", "-y", "-o", "Dpkg::Options::=--force-confdef",
 			"-o", "Dpkg::Options::=--force-confold", "upgrade")
 		return map[string]any{
-			"distro":         distro,
-			"update_stdout":  updateOut,
-			"update_stderr":  updateErr,
-			"upgrade_stdout": upgradeOut,
-			"upgrade_stderr": upgradeErr,
+			"distro": distro, "update_stdout": updateOut, "update_stderr": updateErr,
+			"upgrade_stdout": upgradeOut, "upgrade_stderr": upgradeErr,
 		}, err
 
 	// ---- agent --------------------------------------------------------
@@ -265,15 +315,92 @@ func (d *Dispatcher) run(ctx context.Context, op string, p params) (any, error) 
 		stdout, stderr, err := d.exec.Execute(ctx, p.Command, p.Args...)
 		return map[string]string{"stdout": stdout, "stderr": stderr}, err
 
+	// ---- S3: cluster observation --------------------------------------
+	case "s3.cluster.status":
+		return d.s3obs.PollCluster(ctx)
+
+	case "s3.bucket.stats":
+		return d.s3obs.BucketStats(ctx)
+
+	// ---- S3: bucket management ----------------------------------------
+	case "bucket_create":
+		spec := s3module.BucketSpec{
+			BucketID:          p.BucketID,
+			Name:              p.Name,
+			OwnerTenantID:     p.OwnerTenantID,
+			ReplicationFactor: p.ReplicationFactor,
+			LifecycleRules:    p.LifecycleRules,
+		}
+		if err := d.s3mgr.CreateBucket(ctx, spec); err != nil {
+			return nil, err
+		}
+		return map[string]string{"bucket": p.Name, "status": "created"}, nil
+
+	case "bucket_delete":
+		if err := d.s3mgr.DeleteBucket(ctx, p.Name, p.ForceEmpty); err != nil {
+			return nil, err
+		}
+		return map[string]string{"bucket": p.Name, "status": "deleted"}, nil
+
+	// ---- S3: IAM management -------------------------------------------
+	case "iam_create":
+		user := s3module.IAMUser{
+			Name:       p.Name,
+			AccessKey:  p.AccessKey,
+			BucketACLs: p.BucketACLs,
+		}
+		if err := d.s3mgr.CreateIAMUser(user, p.SecretKey); err != nil {
+			return nil, err
+		}
+		return map[string]string{"name": p.Name, "status": "created"}, nil
+
+	case "iam_delete":
+		if err := d.s3mgr.DeleteIAMUser(p.Name); err != nil {
+			return nil, err
+		}
+		return map[string]string{"name": p.Name, "status": "deleted"}, nil
+
+	case "s3.iam.list":
+		return d.s3mgr.ListIAM()
+
+	// ---- S3: reconcile ------------------------------------------------
+	case "reconcile":
+		if d.lastDesired == nil {
+			return nil, fmt.Errorf("no desired state available — send full_sync first")
+		}
+		desired := *d.lastDesired
+		if p.Scope == "buckets" {
+			desired.IAMUsers = nil
+		} else if p.Scope == "iam" {
+			desired.Buckets = nil
+		}
+		return d.s3mgr.Reconcile(ctx, desired)
+
+	// ---- S3: Nginx customer blocking ----------------------------------
+	case "s3.customer.block":
+		if err := d.s3mgr.BlockAccessKey(p.AccessKey, p.Reason); err != nil {
+			return nil, err
+		}
+		return map[string]string{"access_key": p.AccessKey, "status": "blocked"}, nil
+
+	case "s3.customer.unblock":
+		if err := d.s3mgr.UnblockAccessKey(p.AccessKey); err != nil {
+			return nil, err
+		}
+		return map[string]string{"access_key": p.AccessKey, "status": "unblocked"}, nil
+
+	case "s3.blocked.list":
+		return d.s3mgr.ListBlocked()
+
 	default:
 		return nil, fmt.Errorf("unknown operation %q", op)
 	}
 }
 
-// --- result helpers -----------------------------------------------------------
+// --- result helpers ----------------------------------------------------------
 
 func (d *Dispatcher) ok(src protocol.Envelope, output any) protocol.Envelope {
-	env, err := protocol.ResultFor(src, d.agentUUID, protocol.StatusCompleted, "", output)
+	env, err := protocol.ResultFor(src, d.agentUUID, d.agentType, protocol.StatusCompleted, "", output)
 	if err != nil {
 		d.logger.Error("failed to build result envelope", zap.Error(err))
 	}
@@ -281,7 +408,7 @@ func (d *Dispatcher) ok(src protocol.Envelope, output any) protocol.Envelope {
 }
 
 func (d *Dispatcher) fail(src protocol.Envelope, msg string) protocol.Envelope {
-	env, err := protocol.ResultFor(src, d.agentUUID, protocol.StatusFailed, msg, nil)
+	env, err := protocol.ResultFor(src, d.agentUUID, d.agentType, protocol.StatusFailed, msg, nil)
 	if err != nil {
 		d.logger.Error("failed to build result envelope", zap.Error(err))
 	}
@@ -289,7 +416,7 @@ func (d *Dispatcher) fail(src protocol.Envelope, msg string) protocol.Envelope {
 }
 
 func (d *Dispatcher) reject(src protocol.Envelope, msg string) protocol.Envelope {
-	env, err := protocol.ResultFor(src, d.agentUUID, protocol.StatusRejected, msg, nil)
+	env, err := protocol.ResultFor(src, d.agentUUID, d.agentType, protocol.StatusRejected, msg, nil)
 	if err != nil {
 		d.logger.Error("failed to build result envelope", zap.Error(err))
 	}
@@ -297,14 +424,12 @@ func (d *Dispatcher) reject(src protocol.Envelope, msg string) protocol.Envelope
 }
 
 // detectDebianDistro reads /etc/os-release and returns the distro name if the
-// system is Ubuntu or Debian (or a Debian derivative). Returns "" for other
-// distros and an error only if the file cannot be read.
+// system is Ubuntu or Debian. Returns "" for other distros.
 func detectDebianDistro() (string, error) {
 	data, err := os.ReadFile("/etc/os-release")
 	if err != nil {
 		return "", fmt.Errorf("reading /etc/os-release: %w", err)
 	}
-
 	var id, idLike string
 	for _, line := range strings.Split(string(data), "\n") {
 		line = strings.TrimSpace(line)
@@ -315,7 +440,6 @@ func detectDebianDistro() (string, error) {
 			idLike = strings.ToLower(strings.Trim(strings.TrimPrefix(line, "ID_LIKE="), `"`))
 		}
 	}
-
 	if id == "ubuntu" || id == "debian" ||
 		strings.Contains(idLike, "ubuntu") || strings.Contains(idLike, "debian") {
 		if id != "" {
@@ -327,8 +451,6 @@ func detectDebianDistro() (string, error) {
 }
 
 // emptyParams reports whether raw JSON represents an absence of params.
-// PHP serializes empty arrays as [] and some callers send null or {}.
-// All three are treated as "no params provided".
 func emptyParams(raw []byte) bool {
 	switch string(bytes.TrimSpace(raw)) {
 	case "null", "[]", "{}", "":

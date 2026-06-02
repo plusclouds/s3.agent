@@ -1,43 +1,39 @@
-# PlusClouds Agent v2 Configuration
+# s3d — PlusClouds S3 Storage Agent Configuration
 #
-# This file is the primary source of identity for the agent. In production it
-# is written by the platform during VM provisioning (via the ISO config drive)
-# and the ISO is unmounted before the agent starts. All values here can also be
-# overridden by environment variables (prefix: PLUSCLOUDS_AGENT_).
+# Written by the platform during provisioning. All values can be overridden
+# by environment variables (prefix: PLUSCLOUDS_AGENT_).
 
 nats:
   # Transport: "nats" (TCP) or "websocket" (wss://, no client certificates needed).
   connection_type: websocket
 
-  # Used when connection_type is "nats".
   url: nats://nats.plusclouds.com:4222
-
-  # Used when connection_type is "websocket".
   websocket_url: wss://nats.plusclouds.com:443
 
-  # VM UUID — written here by the platform during provisioning.
-  # Used as the NATS username for authentication.
-  # Override via env: PLUSCLOUDS_AGENT_NATS_AGENT_UUID
+  # Storage server UUID — used as the NATS username.
+  # Override via: PLUSCLOUDS_AGENT_NATS_AGENT_UUID
   agent_uuid: "d6199047-322a-4845-bdea-1d44dd1b49e5"
 
-  # Agent API key — written here by the platform during provisioning.
-  # Used as the NATS password for authentication.
-  # Override via env: PLUSCLOUDS_AGENT_NATS_API_KEY
+  # Agent API key — used as the NATS password.
+  # Override via: PLUSCLOUDS_AGENT_NATS_API_KEY
   api_key: "7Qic72PeIToUWqdiIEcfPxwgVBuNNcLRBjGxuoGEJefeu92NTqanK72JlBeeXBJ3"
 
-  # -1 = unlimited reconnect attempts
   max_reconnects: -1
   reconnect_wait: 5s
 
 agent:
+  # Agent type reported to the platform. Must be "storage" for s3d.
+  type: storage
+
   heartbeat_interval: 30s
   telemetry_interval: 30s
 
   # Operations this agent is permitted to execute.
-  # Remove any entry to disable that operation — the platform will receive a
-  # "rejected" result instead of being able to run it.
+  # Remove any entry to disable it — the platform receives "rejected" instead.
   allowed_operations:
+    # Agent meta
     - agent.allowed_operations
+    # Service management (manages weed-*, nginx via systemd)
     - services.list
     - services.get
     - services.start
@@ -46,6 +42,7 @@ agent:
     - services.reload
     - services.enable
     - services.disable
+    # Host system info
     - system.info
     - system.metrics
     - system.cpu
@@ -54,32 +51,59 @@ agent:
     - system.network
     - system.update
     - telemetry.set_interval
-    # Uncomment to allow arbitrary command execution (see allowed_commands below)
+    # S3 cluster observation
+    - s3.cluster.status
+    - s3.bucket.stats
+    # Bucket management (orchestration-driven)
+    - full_sync
+    - bucket_create
+    - bucket_delete
+    - reconcile
+    # IAM management
+    - iam_create
+    - iam_delete
+    - s3.iam.list
+    # Nginx customer blocking
+    - s3.customer.block
+    - s3.customer.unblock
+    - s3.blocked.list
+    # Exec (runs allowlisted binaries)
     - exec
     # - vm.reboot
     # - vm.shutdown
 
-  # When "exec" is listed above, only these exact binary paths may be invoked.
-  # Requests referencing unlisted paths are rejected.
   allowed_commands:
     - /usr/bin/journalctl
     - /usr/bin/df
     - /usr/bin/free
     - /usr/bin/ls
 
+s3:
+  # SeaweedFS component API endpoints (all internal, localhost-only).
+  master_url: http://localhost:9333
+  volume_url: http://localhost:8080
+  filer_url:  http://localhost:8888
+  s3_url:     http://localhost:8333
+
+  # SeaweedFS S3 IAM config file managed by s3d.
+  iam_file: /etc/seaweedfs/s3.json
+
+  # Systemd unit name reloaded after IAM changes.
+  weed_s3_service: weed-s3
+
+  # Nginx include file managed for customer blocking.
+  nginx_blocked_keys_file: /etc/nginx/conf.d/s3_blocked_keys.conf
+
+  # Capacity thresholds that trigger immediate s3_health events.
+  capacity_warn_pct:     80.0
+  capacity_critical_pct: 90.0
+
 iso:
-  # Mount path checked at startup. In production the ISO is unmounted before
-  # the agent starts, so this is a silent best-effort check. If the ISO is
-  # present and carries a vm_id, it overrides the values above.
   mount_path: /media/plusclouds-config
 
 log:
-  # Log level: debug, info, warn, error
-  level: debug
-  # Log format for stdout: json or console
-  format: console
-  # Optional path to write logs to in addition to stdout (always JSON).
-  # Directory is created automatically. Leave empty to disable.
+  level: info
+  format: json
   file: /var/log/plusclouds/agent.log
 
 autoheal:

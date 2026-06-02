@@ -1,6 +1,6 @@
-// Command plusclouds-agent is the PlusClouds VM agent daemon.
-// It collects system metrics, manages services, and communicates with the
-// PlusClouds platform exclusively via NATS. Supports Linux and Windows.
+// Command s3d is the PlusClouds S3 storage agent daemon.
+// It manages a SeaweedFS S3 cluster, reports real-time health and telemetry,
+// and executes management commands from the orchestration platform via NATS.
 package main
 
 import (
@@ -18,6 +18,7 @@ import (
 	"github.com/plusclouds/ubuntu-agent/internal/config"
 	"github.com/plusclouds/ubuntu-agent/internal/dispatcher"
 	"github.com/plusclouds/ubuntu-agent/internal/executor"
+	s3module "github.com/plusclouds/ubuntu-agent/internal/modules/s3"
 	"github.com/plusclouds/ubuntu-agent/internal/modules/system"
 	natsclient "github.com/plusclouds/ubuntu-agent/internal/nats"
 	"github.com/plusclouds/ubuntu-agent/internal/protocol"
@@ -29,8 +30,8 @@ var cfgFile string
 
 func main() {
 	root := &cobra.Command{
-		Use:     "plusclouds-agent",
-		Short:   "PlusClouds VM Agent",
+		Use:     "s3d",
+		Short:   "PlusClouds S3 Storage Agent",
 		Version: config.AgentVersion,
 		RunE:    run,
 	}
@@ -62,8 +63,14 @@ func run(_ *cobra.Command, _ []string) error {
 	}
 	defer logger.Sync() //nolint:errcheck
 
-	logger.Info("PlusClouds agent starting",
+	agentType := cfg.Agent.Type
+	if agentType == "" {
+		agentType = "storage"
+	}
+
+	logger.Info("s3d starting",
 		zap.String("version", config.AgentVersion),
+		zap.String("agent_type", agentType),
 		zap.String("config_file", cfgFile),
 	)
 
@@ -108,10 +115,13 @@ func run(_ *cobra.Command, _ []string) error {
 	defer svcCleanup()
 
 	// ------------------------------------------------------------------ //
-	// 5. Initialise remaining modules
+	// 5. Initialise modules
 	// ------------------------------------------------------------------ //
 	sysMod := system.New(iso)
 	exec := executor.New(logger)
+	s3obs := s3module.NewObserver(cfg.S3, svcMgr, logger)
+	s3mgr := s3module.NewManager(cfg.S3, exec, logger)
+
 	logger.Info("modules initialised",
 		zap.Int("allowed_operations", len(cfg.Agent.AllowedOperations)),
 		zap.Int("allowed_commands", len(cfg.Agent.AllowedCommands)),
@@ -131,11 +141,11 @@ func run(_ *cobra.Command, _ []string) error {
 	// ------------------------------------------------------------------ //
 	// 7. Create publisher and dispatcher
 	// ------------------------------------------------------------------ //
-	pub := publisher.New(nc, sysMod, agentUUID, cfg.Agent, logger)
+	pub := publisher.New(nc, sysMod, s3obs, agentUUID, agentType, cfg.Agent, logger)
 
 	disp := dispatcher.New(
-		sysMod, svcMgr, exec, pub,
-		agentUUID,
+		sysMod, svcMgr, exec, s3mgr, s3obs, pub,
+		agentUUID, agentType,
 		cfg.Agent.AllowedOperations,
 		cfg.Agent.AllowedCommands,
 		logger,
@@ -170,14 +180,15 @@ func run(_ *cobra.Command, _ []string) error {
 	}
 
 	// ------------------------------------------------------------------ //
-	// 9. Start heartbeat and telemetry publisher
+	// 9. Start publisher loops (heartbeat, telemetry, s3_telemetry, Watch)
 	// ------------------------------------------------------------------ //
 	pub.Start(ctx)
 
-	logger.Info("agent started",
+	logger.Info("s3d started",
 		zap.String("nats_url", cfg.NATS.ActiveURL()),
 		zap.String("cmd_subject", nc.CmdSubject()),
 		zap.String("evt_subject", nc.EvtSubject()),
+		zap.String("agent_type", agentType),
 	)
 
 	// ------------------------------------------------------------------ //
@@ -190,7 +201,7 @@ func run(_ *cobra.Command, _ []string) error {
 
 	logger.Info("initiating graceful shutdown")
 	cancel()
-	logger.Info("agent stopped cleanly")
+	logger.Info("s3d stopped cleanly")
 	return nil
 }
 

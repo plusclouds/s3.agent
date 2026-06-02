@@ -13,12 +13,13 @@ import (
 )
 
 // AgentVersion is set at build time via -ldflags.
-const AgentVersion = "0.2.0"
+const AgentVersion = "1.0.0"
 
 // Config is the top-level configuration structure for the agent.
 type Config struct {
 	NATS     NATSConfig     `mapstructure:"nats"`
 	Agent    AgentConfig    `mapstructure:"agent"`
+	S3       S3Config       `mapstructure:"s3"`
 	ISO      ISOConfig      `mapstructure:"iso"`
 	Log      LogConfig      `mapstructure:"log"`
 	Autoheal AutohealConfig `mapstructure:"autoheal"`
@@ -66,6 +67,8 @@ func (c NATSConfig) ActiveURL() string {
 
 // AgentConfig holds agent behaviour settings.
 type AgentConfig struct {
+	// Type is the agent type reported to the platform (e.g. "storage", "vm").
+	Type string `mapstructure:"type"`
 	// HeartbeatInterval is how often the agent publishes a heartbeat event.
 	HeartbeatInterval time.Duration `mapstructure:"heartbeat_interval"`
 	// TelemetryInterval is how often the agent publishes a telemetry event.
@@ -76,6 +79,28 @@ type AgentConfig struct {
 	// AllowedCommands is the allowlist of binary paths the exec operation may run.
 	// Only consulted when "exec" appears in AllowedOperations.
 	AllowedCommands []string `mapstructure:"allowed_commands"`
+}
+
+// S3Config holds SeaweedFS and related service configuration for the s3d agent.
+type S3Config struct {
+	// SeaweedFS component API endpoints (all internal, localhost-only).
+	MasterURL string `mapstructure:"master_url"` // http://localhost:9333
+	VolumeURL string `mapstructure:"volume_url"` // http://localhost:8080
+	FilerURL  string `mapstructure:"filer_url"`  // http://localhost:8888
+	S3URL     string `mapstructure:"s3_url"`     // http://localhost:8333
+
+	// IAMFile is the path to the SeaweedFS S3 IAM config file.
+	IAMFile string `mapstructure:"iam_file"` // /etc/seaweedfs/s3.json
+	// WeedS3Service is the systemd unit name reloaded after IAM changes.
+	WeedS3Service string `mapstructure:"weed_s3_service"` // weed-s3
+
+	// NginxBlockedKeysFile is the Nginx include file managed for customer blocking.
+	NginxBlockedKeysFile string `mapstructure:"nginx_blocked_keys_file"`
+
+	// CapacityWarnPct triggers an immediate s3_health event when crossed.
+	CapacityWarnPct float64 `mapstructure:"capacity_warn_pct"` // 80.0
+	// CapacityCriticalPct triggers an immediate s3_health event when crossed.
+	CapacityCriticalPct float64 `mapstructure:"capacity_critical_pct"` // 90.0
 }
 
 // ISOConfig holds ISO/config-drive settings.
@@ -145,6 +170,18 @@ func Load(cfgFile string) (*Config, error) {
 }
 
 func setDefaults(v *viper.Viper) {
+	v.SetDefault("agent.type", "storage")
+
+	v.SetDefault("s3.master_url", "http://localhost:9333")
+	v.SetDefault("s3.volume_url", "http://localhost:8080")
+	v.SetDefault("s3.filer_url", "http://localhost:8888")
+	v.SetDefault("s3.s3_url", "http://localhost:8333")
+	v.SetDefault("s3.iam_file", "/etc/seaweedfs/s3.json")
+	v.SetDefault("s3.weed_s3_service", "weed-s3")
+	v.SetDefault("s3.nginx_blocked_keys_file", "/etc/nginx/conf.d/s3_blocked_keys.conf")
+	v.SetDefault("s3.capacity_warn_pct", 80.0)
+	v.SetDefault("s3.capacity_critical_pct", 90.0)
+
 	v.SetDefault("nats.connection_type", ConnectionTypeNATS)
 	v.SetDefault("nats.url", "nats://localhost:4222")
 	v.SetDefault("nats.websocket_url", "ws://localhost:8080")
@@ -175,6 +212,18 @@ func setDefaults(v *viper.Viper) {
 		"telemetry.set_interval",
 		"vm.reboot",
 		"vm.shutdown",
+		"full_sync",
+		"bucket_create",
+		"bucket_delete",
+		"iam_create",
+		"iam_delete",
+		"reconcile",
+		"s3.cluster.status",
+		"s3.bucket.stats",
+		"s3.iam.list",
+		"s3.customer.block",
+		"s3.customer.unblock",
+		"s3.blocked.list",
 	})
 	v.SetDefault("agent.allowed_commands", []string{})
 

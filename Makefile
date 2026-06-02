@@ -1,9 +1,9 @@
 # PlusClouds Ubuntu Agent Makefile
 
-BINARY_AGENT   := plusclouds-agent
-BINARY_CTL     := plsctl
-BINARY_LINUX   := plusclouds.linux
-BINARY_WINDOWS := plusclouds.windows
+BINARY_AGENT   := s3d
+BINARY_CTL     := s3dctl
+BINARY_LINUX   := s3d.linux
+BINARY_WINDOWS := s3d.windows
 CMD_AGENT      := ./cmd/agent
 CMD_CTL        := ./cmd/ctl
 BUILD_DIR      := ./bin
@@ -21,6 +21,8 @@ INSTALL_DIR    := /usr/local/bin
 SERVICE_DIR    := /etc/systemd/system
 CONFIG_DIR     := /etc/plusclouds
 LOG_DIR        := /var/log/plusclouds
+SEAWEEDFS_CFG  := /etc/seaweedfs
+NGINX_CFG      := /etc/nginx/conf.d
 
 .PHONY: all build build-agent build-ctl build-prod build-linux build-windows build-all test lint clean install uninstall package-deb help
 
@@ -30,14 +32,14 @@ all: build
 ## build: build both binaries for development (current OS/arch)
 build: build-agent build-ctl
 
-## build-agent: build the agent daemon (development)
+## build-agent: build the s3d daemon (development)
 build-agent:
 	@echo "Building $(BINARY_AGENT) (dev)..."
 	@mkdir -p $(BUILD_DIR)
 	go build $(LDFLAGS) -o $(BUILD_DIR)/$(BINARY_AGENT) $(CMD_AGENT)
 	@echo "Done: $(BUILD_DIR)/$(BINARY_AGENT)"
 
-## build-ctl: build the plsctl CLI (development)
+## build-ctl: build the s3dctl CLI (development)
 build-ctl:
 	@echo "Building $(BINARY_CTL) (dev)..."
 	@mkdir -p $(BUILD_DIR)
@@ -47,7 +49,7 @@ build-ctl:
 ## build-prod: alias for build-linux (backwards compatibility)
 build-prod: build-linux
 
-## build-linux: build production binary for Linux amd64 → bin/plusclouds.linux
+## build-linux: build production binary for Linux amd64 → bin/s3d.linux
 build-linux:
 	@echo "Building $(BINARY_LINUX) $(VERSION) (linux/amd64)..."
 	@mkdir -p $(BUILD_DIR)
@@ -58,7 +60,7 @@ build-linux:
 	@echo "Size: $$(du -sh $(BUILD_DIR)/$(BINARY_LINUX) | cut -f1)"
 	@file $(BUILD_DIR)/$(BINARY_LINUX)
 
-## build-windows: build production binary for Windows amd64 → bin/plusclouds.windows
+## build-windows: build production binary for Windows amd64 → bin/s3d.windows
 build-windows:
 	@echo "Building $(BINARY_WINDOWS) $(VERSION) (windows/amd64)..."
 	@mkdir -p $(BUILD_DIR)
@@ -72,7 +74,7 @@ build-windows:
 build-all: build-linux build-windows
 	@echo ""
 	@echo "All platform binaries:"
-	@ls -lh $(BUILD_DIR)/plusclouds.*
+	@ls -lh $(BUILD_DIR)/s3d.*
 
 ## test: run all tests with race detector and coverage
 test:
@@ -100,7 +102,7 @@ install: build-prod
 	@echo "Installing $(BINARY_CTL) to $(INSTALL_DIR)..."
 	install -m 0755 $(BUILD_DIR)/$(BINARY_CTL) $(INSTALL_DIR)/$(BINARY_CTL)
 	@echo "Installing systemd unit..."
-	install -m 0644 systemd/plusclouds-agent.service $(SERVICE_DIR)/plusclouds-agent.service
+	install -m 0644 systemd/plusclouds-agent.service $(SERVICE_DIR)/s3d.service
 	@echo "Creating directories..."
 	@mkdir -p $(CONFIG_DIR) $(LOG_DIR)
 	@chmod 0750 $(LOG_DIR)
@@ -114,14 +116,15 @@ install: build-prod
 	@echo ""
 	@echo "Install complete. Next steps:"
 	@echo "  1. Edit $(CONFIG_DIR)/agent.yaml (set nats.agent_uuid and nats.api_key)"
-	@echo "  2. systemctl enable --now plusclouds-agent"
-	@echo "  3. journalctl -fu plusclouds-agent"
+	@echo "  2. systemctl enable --now s3d"
+	@echo "  3. journalctl -fu s3d"
+	@echo "  4. s3dctl check"
 
 ## uninstall: remove binaries and systemd unit (does not remove config or logs)
 uninstall:
-	systemctl disable --now plusclouds-agent 2>/dev/null || true
+	systemctl disable --now s3d 2>/dev/null || true
 	rm -f $(INSTALL_DIR)/$(BINARY_AGENT) $(INSTALL_DIR)/$(BINARY_CTL)
-	rm -f $(SERVICE_DIR)/plusclouds-agent.service
+	rm -f $(SERVICE_DIR)/s3d.service
 	systemctl daemon-reload
 	@echo "Uninstall complete. Config and logs preserved."
 
