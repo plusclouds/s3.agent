@@ -17,23 +17,20 @@ import (
 type Client struct {
 	conn      *nats.Conn
 	agentUUID string
+	agentType string
 	logger    *zap.Logger
 }
 
-// Connect establishes a NATS connection authenticated with agentUUID / agentAPIKey
-// and returns a ready Client.
-//
-// The agent JWT issued by the NATS auth callout grants permission only to:
-//   - Subscribe: agent.vm.{uuid}.cmd
-//   - Publish:   agent.vm.{uuid}.evt
-//
-// JetStream consumer management (which requires $JS.API.* publish and _INBOX.*
-// subscribe) is therefore not available to the agent. Message durability is
-// handled server-side by the AGENT_COMMANDS JetStream stream; the platform
-// retries unacknowledged commands via AgentCommandTimeoutCommand.
-func Connect(cfg config.NATSConfig, agentUUID, agentAPIKey string, logger *zap.Logger) (*Client, error) {
+// Connect establishes a NATS connection authenticated with agentUUID / agentAPIKey.
+// agentType sets the subject prefix (agent.{type}.{uuid}.cmd/evt) unless
+// cfg.SubjectType overrides it (use "vm" for agents registered as VM type on the platform).
+func Connect(cfg config.NATSConfig, agentUUID, agentAPIKey, agentType string, logger *zap.Logger) (*Client, error) {
+	subjectType := agentType
+	if cfg.SubjectType != "" {
+		subjectType = cfg.SubjectType
+	}
 	opts := []nats.Option{
-		nats.Name("plusclouds-vm-agent:" + agentUUID),
+		nats.Name("plusclouds-" + agentType + "-agent:" + agentUUID),
 		nats.UserInfo(agentUUID, agentAPIKey),
 		nats.MaxReconnects(cfg.MaxReconnects),
 		nats.ReconnectWait(cfg.ReconnectWait),
@@ -70,24 +67,24 @@ func Connect(cfg config.NATSConfig, agentUUID, agentAPIKey string, logger *zap.L
 	return &Client{
 		conn:      nc,
 		agentUUID: agentUUID,
+		agentType: subjectType,
 		logger:    logger,
 	}, nil
 }
 
 // CmdSubject returns the subject the agent subscribes to for inbound commands.
 func (c *Client) CmdSubject() string {
-	return "agent.vm." + c.agentUUID + ".cmd"
+	return "agent." + c.agentType + "." + c.agentUUID + ".cmd"
 }
 
 // EvtSubject returns the subject the agent publishes events to.
 func (c *Client) EvtSubject() string {
-	return "agent.vm." + c.agentUUID + ".evt"
+	return "agent." + c.agentType + "." + c.agentUUID + ".evt"
 }
 
-// TelemetrySubject returns the client-facing telemetry subject captured by
-// the VM_TELEMETRY JetStream stream (15-minute retention).
+// TelemetrySubject returns the client-facing telemetry subject.
 func (c *Client) TelemetrySubject() string {
-	return "vm." + c.agentUUID + ".telemetry"
+	return c.agentType + "." + c.agentUUID + ".telemetry"
 }
 
 // Subscribe registers a plain NATS subscription on the cmd subject.

@@ -3,7 +3,6 @@ package s3
 import (
 	"context"
 	"encoding/json"
-	"encoding/xml"
 	"fmt"
 	"io"
 	"net/http"
@@ -54,13 +53,15 @@ func (o *Observer) PollCluster(ctx context.Context) (*ClusterComponents, error) 
 	}, nil
 }
 
-// BucketStats queries the filer API for per-bucket usage.
+// BucketStats queries the filer REST API for directory entries under /buckets/.
+// The filer returns JSON when the Accept: application/json header is set.
 func (o *Observer) BucketStats(ctx context.Context) ([]BucketStat, error) {
-	url := o.cfg.FilerURL + "/buckets?pretty=y"
+	url := o.cfg.FilerURL + "/buckets/"
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
 		return nil, fmt.Errorf("building request: %w", err)
 	}
+	req.Header.Set("Accept", "application/json")
 
 	resp, err := o.client.Do(req)
 	if err != nil {
@@ -68,22 +69,23 @@ func (o *Observer) BucketStats(ctx context.Context) ([]BucketStat, error) {
 	}
 	defer resp.Body.Close()
 
-	// The filer returns an S3-style ListAllMyBucketsResult XML.
 	var result struct {
-		Buckets struct {
-			Bucket []struct {
-				Name string `xml:"Name"`
-			} `xml:"Bucket"`
-		} `xml:"Buckets"`
+		Entries []struct {
+			FullPath string `json:"FullPath"`
+		} `json:"Entries"`
 	}
-	if err := xml.NewDecoder(resp.Body).Decode(&result); err != nil {
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
 		return nil, fmt.Errorf("parsing bucket list: %w", err)
 	}
 
-	stats := make([]BucketStat, 0, len(result.Buckets.Bucket))
-	for _, b := range result.Buckets.Bucket {
+	stats := make([]BucketStat, 0, len(result.Entries))
+	for _, e := range result.Entries {
+		name := e.FullPath
+		if idx := len("/buckets/"); len(name) > idx {
+			name = name[idx:]
+		}
 		stats = append(stats, BucketStat{
-			Name:          b.Name,
+			Name:          name,
 			ReplicaHealth: "ok",
 		})
 	}
@@ -321,21 +323,13 @@ func (o *Observer) pollS3Gateway(ctx context.Context, now time.Time) S3GatewayCo
 	bucketCount := 0
 	reachable := false
 
-	// List all buckets via the S3 API (no auth needed on localhost admin identity).
-	body, err := o.getBody(ctx, o.cfg.S3URL+"/")
-	if err == nil {
+	// Probe the S3 gateway with a HEAD request — any HTTP response means it's up.
+	// (A 403 means auth is required, which is correct behaviour.)
+	req, _ := http.NewRequestWithContext(ctx, http.MethodHead, o.cfg.S3URL+"/", nil)
+	if resp, err := o.client.Do(req); err == nil {
+		resp.Body.Close()
 		reachable = true
-		// Count <Bucket> elements without full XML parsing.
-		var listResp struct {
-			Buckets struct {
-				Bucket []struct {
-					Name string `xml:"Name"`
-				} `xml:"Bucket"`
-			} `xml:"Buckets"`
-		}
-		if xmlErr := xml.Unmarshal(body, &listResp); xmlErr == nil {
-			bucketCount = len(listResp.Buckets.Bucket)
-		}
+		_ = bucketCount // populated by BucketStats via filer
 	}
 
 	return S3GatewayComponent{

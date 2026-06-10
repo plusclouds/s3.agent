@@ -510,6 +510,7 @@ nats:
   websocket_url: wss://nats.plusclouds.com:443
   agent_uuid: "$AGENT_UUID"
   api_key:    "$API_KEY"
+  subject_type: vm
   max_reconnects: -1
   reconnect_wait: 5s
 
@@ -555,7 +556,7 @@ agent:
 
 s3:
   master_url: http://localhost:9333
-  volume_url: http://localhost:8080
+  volume_url: http://$SERVER_IP:8080
   filer_url:  http://localhost:8888
   s3_url:     http://localhost:8333
   iam_file:        $WEED_CONFIG_DIR/s3.json

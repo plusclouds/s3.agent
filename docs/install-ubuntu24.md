@@ -720,30 +720,29 @@ journalctl -u s3d -n 20 --no-pager | grep -E "started|NATS|error"
 
 ### Quick S3 API smoke test
 
-Create a test bucket and upload a small file directly to the S3 gateway
-(bypassing Nginx, for internal validation only):
+Test the S3 gateway directly using `curl` (no extra tools needed):
 
 ```bash
-# Install the AWS CLI if needed
-apt-get install -y awscli
+# Create a test bucket (PUT request — no auth required on localhost)
+curl -s -o /dev/null -w "%{http_code}" \
+  -X PUT http://localhost:8333/smoke-test
+# Expected: 200
 
-# Configure with a test identity (after creating one via s3dctl iam create)
-aws configure set aws_access_key_id     AKIATEST
-aws configure set aws_secret_access_key testSecretKey
-aws configure set region                us-east-1
+# Upload a small object
+echo "hello world" | curl -s -o /dev/null -w "%{http_code}" \
+  -X PUT http://localhost:8333/smoke-test/hello.txt \
+  -H "Content-Type: text/plain" \
+  --data-binary @-
+# Expected: 200
 
-# Test against localhost (internal, bypassing Nginx)
-aws s3 mb s3://smoke-test \
-  --endpoint-url http://localhost:8333
+# List bucket contents
+curl -s "http://localhost:8333/smoke-test?list-type=2" | grep -o '<Key>[^<]*</Key>'
+# Expected: <Key>hello.txt</Key>
 
-echo "hello world" | aws s3 cp - s3://smoke-test/hello.txt \
-  --endpoint-url http://localhost:8333
-
-aws s3 ls s3://smoke-test \
-  --endpoint-url http://localhost:8333
-
-aws s3 rb s3://smoke-test --force \
-  --endpoint-url http://localhost:8333
+# Delete the object and bucket
+curl -s -o /dev/null -w "%{http_code}" -X DELETE http://localhost:8333/smoke-test/hello.txt
+curl -s -o /dev/null -w "%{http_code}" -X DELETE http://localhost:8333/smoke-test
+# Expected: 204 and 204
 ```
 
 ---

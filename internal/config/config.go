@@ -50,6 +50,10 @@ type NATSConfig struct {
 	// does not carry an agent_api_key. The ISO value always takes precedence.
 	// Can also be set via PLUSCLOUDS_AGENT_NATS_API_KEY environment variable.
 	APIKey string `mapstructure:"api_key"`
+	// SubjectType overrides the type segment used in NATS subjects
+	// (agent.{type}.{uuid}.cmd/evt). Defaults to agent.type from config.
+	// Set to "vm" if the agent is registered as a VM agent on the platform.
+	SubjectType string `mapstructure:"subject_type"`
 	// MaxReconnects controls how many times the client retries on disconnect.
 	// -1 means unlimited.
 	MaxReconnects int `mapstructure:"max_reconnects"`
@@ -187,6 +191,7 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("nats.websocket_url", "ws://localhost:8080")
 	v.SetDefault("nats.agent_uuid", "")
 	v.SetDefault("nats.api_key", "")
+	v.SetDefault("nats.subject_type", "")
 	v.SetDefault("nats.max_reconnects", -1)
 	v.SetDefault("nats.reconnect_wait", 5*time.Second)
 

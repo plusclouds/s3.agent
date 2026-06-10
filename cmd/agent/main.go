@@ -132,7 +132,7 @@ func run(_ *cobra.Command, _ []string) error {
 	// ------------------------------------------------------------------ //
 	// 6. Connect to NATS
 	// ------------------------------------------------------------------ //
-	nc, err := natsclient.Connect(cfg.NATS, agentUUID, agentAPIKey, logger)
+	nc, err := natsclient.Connect(cfg.NATS, agentUUID, agentAPIKey, agentType, logger)
 	if err != nil {
 		return fmt.Errorf("NATS connection failed: %w", err)
 	}
