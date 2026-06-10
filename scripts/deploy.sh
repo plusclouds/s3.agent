@@ -479,8 +479,12 @@ if [[ "$SKIP_AGENT" == false ]]; then
 
   # Binary — use local path if provided, otherwise download latest release
   if [[ -n "$S3D_BINARY" ]]; then
-    cp "$S3D_BINARY" /usr/local/bin/s3d
-    info "Installed s3d from local path: $S3D_BINARY"
+    if [[ "$S3D_BINARY" -ef /usr/local/bin/s3d ]]; then
+      info "s3d binary is already at destination — skipping copy."
+    else
+      cp "$S3D_BINARY" /usr/local/bin/s3d
+      info "Installed s3d from local path: $S3D_BINARY"
+    fi
   elif [[ ! -x /usr/local/bin/s3d ]]; then
     die "No s3d binary found at /usr/local/bin/s3d and --s3d-binary was not provided.
 Build it first with:  make build
@@ -490,8 +494,12 @@ Then pass:            --s3d-binary bin/s3d.linux"
   fi
 
   if [[ -n "$S3DCTL_BINARY" ]]; then
-    cp "$S3DCTL_BINARY" /usr/local/bin/s3dctl
-    info "Installed s3dctl from local path: $S3DCTL_BINARY"
+    if [[ "$S3DCTL_BINARY" -ef /usr/local/bin/s3dctl ]]; then
+      info "s3dctl binary is already at destination — skipping copy."
+    else
+      cp "$S3DCTL_BINARY" /usr/local/bin/s3dctl
+      info "Installed s3dctl from local path: $S3DCTL_BINARY"
+    fi
   elif [[ -x /usr/local/bin/s3dctl ]]; then
     info "s3dctl already present — skipping install."
   fi
