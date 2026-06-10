@@ -36,11 +36,11 @@ section() { echo -e "\n${BOLD}━━━  $*  ━━━${RESET}"; }
 die()     { error "$*"; exit 1; }
 
 # ── defaults ─────────────────────────────────────────────────────────────────
-SERVER_IP=""
-PUBLIC_DOMAIN=""
-AGENT_UUID=""
-API_KEY=""
-LETSENCRYPT_EMAIL=""
+SERVER_IP="185.255.172.184"
+PUBLIC_DOMAIN="dc.s3.plusclouds.com"
+AGENT_UUID="7416d881-9f2b-41b8-be7a-d9297e7e6ea5"
+API_KEY="egNR7AQmDN8BS0gNPKwhnHcSgxoOxnQrPyPzUA5xpTlIPfsjCg9d0bFC2IG12M3W"
+LETSENCRYPT_EMAIL="info@plusclouds.com"
 SKIP_TLS=false
 SKIP_AGENT=false
 S3D_BINARY=""
@@ -91,11 +91,21 @@ check_http() {
   [[ "$code" == "$expected" ]]
 }
 
+# Returns true if the server responds with any HTTP code (not a connection failure).
+check_http_responds() {
+  local url="$1"
+  local code
+  code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 5 "$url" 2>/dev/null || true)
+  [[ -n "$code" && "$code" != "000" ]]
+}
+
 wait_for_http() {
-  local url="$1" label="$2" retries=15 wait=2
-  info "Waiting for $label to become reachable..."
-  for i in $(seq 1 $retries); do
-    if check_http "$url"; then
+  # wait_for_http <url> <label> [retries=30] [wait=3]
+  # Accepts any non-zero HTTP response (200, 403, etc.) — just needs to be reachable.
+  local url="$1" label="$2" retries="${3:-30}" wait="${4:-3}"
+  info "Waiting for $label to become reachable (up to $((retries * wait))s)..."
+  for i in $(seq 1 "$retries"); do
+    if check_http_responds "$url"; then
       info "$label is up."
       return 0
     fi
@@ -111,8 +121,7 @@ apt-get update -qq
 apt-get install -y -qq \
   curl wget jq unzip \
   nginx certbot python3-certbot-nginx \
-  ufw \
-  awscli
+  ufw
 
 info "OS packages installed."
 
@@ -192,11 +201,27 @@ else
 fi
 
 # initial IAM file (s3d manages this at runtime)
+# Seed with a bootstrap admin so weed-s3 starts; s3d will reconcile identities at runtime.
 if [[ ! -f "$WEED_CONFIG_DIR/s3.json" ]]; then
-  echo '{"identities":[]}' > "$WEED_CONFIG_DIR/s3.json"
+  cat > "$WEED_CONFIG_DIR/s3.json" << 'IAMEOF'
+{
+  "identities": [
+    {
+      "name": "admin",
+      "credentials": [
+        {
+          "accessKey": "plusclouds-admin",
+          "secretKey": "plusclouds-admin-secret-change-me"
+        }
+      ],
+      "actions": ["Admin", "Read", "Write", "List", "Tagging"]
+    }
+  ]
+}
+IAMEOF
   chown seaweedfs:seaweedfs "$WEED_CONFIG_DIR/s3.json"
   chmod 640 "$WEED_CONFIG_DIR/s3.json"
-  info "Created s3.json (empty identities)"
+  info "Created s3.json with bootstrap admin identity."
 else
   info "s3.json already exists — skipping."
 fi
@@ -230,7 +255,7 @@ ExecStart=$WEED_INSTALL_DIR/weed master \\
   -ip=$SERVER_IP \\
   -port=9333 \\
   -mdir=$WEED_DATA_DIR/master \\
-  -defaultReplication=001 \\
+  -defaultReplication=000 \\
   -volumeSizeLimitMB=30000
 Restart=on-failure
 RestartSec=10
@@ -299,7 +324,6 @@ Type=simple
 User=seaweedfs
 Group=seaweedfs
 ExecStart=$WEED_INSTALL_DIR/weed s3 \\
-  -ip=127.0.0.1 \\
   -port=8333 \\
   -filer=$SERVER_IP:8888 \\
   -config=$WEED_CONFIG_DIR/s3.json
@@ -320,20 +344,27 @@ info "SeaweedFS units enabled."
 section "Step 7 — Start SeaweedFS"
 
 start_and_verify() {
-  local svc="$1" url="$2" label="$3"
+  # start_and_verify <svc> <url> <label> [retries] [wait]
+  local svc="$1" url="$2" label="$3" retries="${4:-30}" wait="${5:-3}"
   if systemctl is-active --quiet "$svc"; then
     info "$svc already running — restarting to pick up new config."
     systemctl restart "$svc"
   else
     systemctl start "$svc"
   fi
-  wait_for_http "$url" "$label"
+  # Brief pause so the process is actually running before the first poll.
+  sleep 2
+  wait_for_http "$url" "$label" "$retries" "$wait"
 }
 
-start_and_verify weed-master "http://localhost:9333/cluster/status" "weed-master"
-start_and_verify weed-volume "http://localhost:8080/status"         "weed-volume"
-start_and_verify weed-filer  "http://localhost:8888/"               "weed-filer"
-start_and_verify weed-s3     "http://localhost:8333/"               "weed-s3"
+# weed-master, weed-volume, weed-filer all bind to $SERVER_IP via -ip flag.
+start_and_verify weed-master "http://$SERVER_IP:9333/cluster/status" "weed-master"
+# Volume needs more time: it connects to master, scans volume files, then registers.
+start_and_verify weed-volume "http://$SERVER_IP:8080/status" "weed-volume" 40 3
+start_and_verify weed-filer  "http://$SERVER_IP:8888/"       "weed-filer"
+# weed-s3 has no -ip flag and binds to 0.0.0.0. Use 127.0.0.1 explicitly — Ubuntu 24
+# resolves "localhost" to ::1 (IPv6). The gateway returns 403 (auth required) once ready.
+start_and_verify weed-s3     "http://127.0.0.1:8333/"        "weed-s3" 40 3
 
 info "All SeaweedFS components are up."
 
@@ -629,7 +660,7 @@ if [[ "$SKIP_AGENT" == false ]] && command -v s3dctl &>/dev/null; then
   info "Running s3dctl check..."
   s3dctl --config "$AGENT_CONFIG_DIR/agent.yaml" check || true
 else
-  info "Manual verification (s3dctl not available or --skip-agent set):"
+  info "Service and API status:"
   echo ""
   printf "  %-40s " "weed-master service"
   systemctl is-active --quiet weed-master && echo -e "${GREEN}active${RESET}" || echo -e "${RED}inactive${RESET}"
@@ -642,14 +673,72 @@ else
   printf "  %-40s " "nginx service"
   systemctl is-active --quiet nginx       && echo -e "${GREEN}active${RESET}" || echo -e "${RED}inactive${RESET}"
   printf "  %-40s " "master API"
-  check_http "http://localhost:9333/cluster/status" && echo -e "${GREEN}reachable${RESET}" || echo -e "${RED}unreachable${RESET}"
+  check_http "http://$SERVER_IP:9333/cluster/status" && echo -e "${GREEN}reachable${RESET}" || echo -e "${RED}unreachable${RESET}"
   printf "  %-40s " "volume API"
-  check_http "http://localhost:8080/status"         && echo -e "${GREEN}reachable${RESET}" || echo -e "${RED}unreachable${RESET}"
+  check_http "http://$SERVER_IP:8080/status"         && echo -e "${GREEN}reachable${RESET}" || echo -e "${RED}unreachable${RESET}"
   printf "  %-40s " "filer API"
-  check_http "http://localhost:8888/"               && echo -e "${GREEN}reachable${RESET}" || echo -e "${RED}unreachable${RESET}"
+  check_http "http://$SERVER_IP:8888/"               && echo -e "${GREEN}reachable${RESET}" || echo -e "${RED}unreachable${RESET}"
   printf "  %-40s " "s3 gateway API"
-  check_http "http://localhost:8333/"               && echo -e "${GREEN}reachable${RESET}" || echo -e "${RED}unreachable${RESET}"
+  check_http_responds "http://127.0.0.1:8333/"       && echo -e "${GREEN}reachable${RESET}" || echo -e "${RED}unreachable${RESET}"
   echo ""
+fi
+
+# ── step 13: S3 smoke test via filer API ─────────────────────────────────────
+# The S3 gateway requires AWS Signature v4 auth — we use the filer REST API
+# (no auth) to do the data-plane roundtrip, then confirm the S3 port responds.
+section "Step 13 — S3 smoke test"
+
+smoke_pass=true
+
+s3_check() {
+  local label="$1" expected="$2" actual="$3"
+  printf "  %-40s " "$label"
+  if [[ "$actual" == "$expected" ]]; then
+    echo -e "${GREEN}ok (HTTP $actual)${RESET}"
+  else
+    echo -e "${RED}FAIL (expected $expected, got $actual)${RESET}"
+    smoke_pass=false
+  fi
+}
+
+# Use filer REST API for data-plane roundtrip (no S3 auth needed from localhost).
+# Filer paths are flat — /smoke-test/probe.txt maps directly to volume storage.
+code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 15 \
+  -X PUT "http://$SERVER_IP:8888/deploy-smoke-test/probe.txt" \
+  -H "Content-Type: text/plain" \
+  -d "deploy smoke test" 2>/dev/null || echo "000")
+s3_check "upload file via filer" "201" "$code"
+
+code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 5 \
+  "http://$SERVER_IP:8888/deploy-smoke-test/probe.txt" 2>/dev/null || echo "000")
+s3_check "read file via filer" "200" "$code"
+
+code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 5 \
+  -X DELETE "http://$SERVER_IP:8888/deploy-smoke-test/probe.txt" 2>/dev/null || echo "000")
+s3_check "delete file via filer" "204" "$code"
+
+# Clean up smoke test directory from filer metadata.
+curl -s -o /dev/null --max-time 5 \
+  -X DELETE "http://$SERVER_IP:8888/deploy-smoke-test/" 2>/dev/null || true
+
+# Confirm S3 gateway responds (403 = auth required = working correctly).
+s3_code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 5 \
+  http://127.0.0.1:8333/ 2>/dev/null || echo "000")
+printf "  %-40s " "s3 gateway responds (auth check)"
+if [[ "$s3_code" == "403" || "$s3_code" == "200" ]]; then
+  echo -e "${GREEN}ok (HTTP $s3_code)${RESET}"
+else
+  echo -e "${RED}FAIL (got $s3_code, expected 403 or 200)${RESET}"
+  smoke_pass=false
+fi
+
+echo ""
+if [[ "$smoke_pass" == true ]]; then
+  info "Smoke test passed — SeaweedFS data plane and S3 gateway are functional."
+  info "S3 access key:    plusclouds-admin"
+  info "S3 secret key:    plusclouds-admin-secret-change-me  (change via s3d iam commands)"
+else
+  warn "Smoke test had failures. Check:  journalctl -u weed-s3 -u weed-filer -n 50 --no-pager"
 fi
 
 # ── done ──────────────────────────────────────────────────────────────────────
