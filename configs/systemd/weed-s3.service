@@ -1,0 +1,21 @@
+[Unit]
+Description=SeaweedFS S3 Gateway
+After=weed-filer.service
+Requires=weed-filer.service
+
+[Service]
+Type=simple
+User=seaweedfs
+Group=seaweedfs
+ExecStart=/usr/local/bin/weed s3 \
+  -port=8333 \
+  -filer=185.255.172.184:8888 \
+  -config=/etc/seaweedfs/s3.json
+Restart=on-failure
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=weed-s3
+
+[Install]
+WantedBy=multi-user.target

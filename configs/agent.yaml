@@ -12,18 +12,22 @@ nats:
 
   # Storage server UUID — used as the NATS username.
   # Override via: PLUSCLOUDS_AGENT_NATS_AGENT_UUID
-  agent_uuid: "d6199047-322a-4845-bdea-1d44dd1b49e5"
+  agent_uuid: "9e09aeda-20eb-4d70-a393-34f2ccc474ee"
 
   # Agent API key — used as the NATS password.
   # Override via: PLUSCLOUDS_AGENT_NATS_API_KEY
-  api_key: "7Qic72PeIToUWqdiIEcfPxwgVBuNNcLRBjGxuoGEJefeu92NTqanK72JlBeeXBJ3"
+  api_key: "xgUEJKE5lMGDcqsnTMgEWniT3tpotq5ZFnNZjmxdI3wTy6OCbKrSmC9kI0W1jKbE"
+
+  # subject_type overrides the NATS subject prefix (agent.{type}.{uuid}).
+  # Defaults to agent.type when unset.
+  subject_type: s3
 
   max_reconnects: -1
   reconnect_wait: 5s
 
 agent:
-  # Agent type reported to the platform. Must be "storage" for s3d.
-  type: storage
+  # Agent type reported to the platform.
+  type: s3
 
   heartbeat_interval: 30s
   telemetry_interval: 30s
@@ -57,8 +61,13 @@ agent:
     # Bucket management (orchestration-driven)
     - full_sync
     - bucket_create
+    - bucket_update
     - bucket_delete
     - reconcile
+    # WORM / Object Lock bucket management
+    - worm_bucket_create
+    - worm_bucket_update
+    - worm_bucket_delete
     # IAM management
     - iam_create
     - iam_delete
@@ -69,19 +78,16 @@ agent:
     - s3.blocked.list
     # Exec (runs allowlisted binaries)
     - exec
-    # - vm.reboot
-    # - vm.shutdown
 
   allowed_commands:
     - /usr/bin/journalctl
     - /usr/bin/df
     - /usr/bin/free
-    - /usr/bin/ls
 
 s3:
   # SeaweedFS component API endpoints (all internal, localhost-only).
   master_url: http://localhost:9333
-  volume_url: http://localhost:8080
+  volume_url: http://185.255.172.184:8080
   filer_url:  http://localhost:8888
   s3_url:     http://localhost:8333
 
@@ -93,10 +99,18 @@ s3:
 
   # Nginx include file managed for customer blocking.
   nginx_blocked_keys_file: /etc/nginx/conf.d/s3_blocked_keys.conf
+  nginx_access_log: /var/log/nginx/s3_access.log
+  nginx_audit_log:  /var/log/nginx/s3_audit.log
 
   # Capacity thresholds that trigger immediate s3_health events.
   capacity_warn_pct:     80.0
   capacity_critical_pct: 90.0
+
+  # Admin credentials for signing bucket API requests (PUT/DELETE /{bucket}).
+  # Must match an identity with "Admin" actions in s3.json.
+  admin_access_key: "pcsadmin9e09aeda"
+  admin_secret_key: "Xfk6VbWcsqCZcGurFRb8XZ0PojyhDZiOgYpjktER"
+  s3_region: us-east-1
 
 iso:
   mount_path: /media/plusclouds-config

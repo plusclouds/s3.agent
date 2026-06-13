@@ -100,11 +100,23 @@ type S3Config struct {
 
 	// NginxBlockedKeysFile is the Nginx include file managed for customer blocking.
 	NginxBlockedKeysFile string `mapstructure:"nginx_blocked_keys_file"`
+	// NginxAccessLog is the Nginx access log parsed for per-bucket traffic accounting.
+	NginxAccessLog string `mapstructure:"nginx_access_log"`
+	// NginxAuditLog is the Nginx audit log tailed for real-time mutation events (PUT/DELETE).
+	NginxAuditLog string `mapstructure:"nginx_audit_log"`
 
 	// CapacityWarnPct triggers an immediate s3_health event when crossed.
 	CapacityWarnPct float64 `mapstructure:"capacity_warn_pct"` // 80.0
 	// CapacityCriticalPct triggers an immediate s3_health event when crossed.
 	CapacityCriticalPct float64 `mapstructure:"capacity_critical_pct"` // 90.0
+
+	// AdminAccessKey is the S3 admin credential used to sign bucket API requests
+	// (PUT/DELETE /{bucket}). Must match an identity with "Admin" actions in s3.json.
+	AdminAccessKey string `mapstructure:"admin_access_key"`
+	// AdminSecretKey is the secret key for AdminAccessKey.
+	AdminSecretKey string `mapstructure:"admin_secret_key"`
+	// S3Region is the region sent in AWS Sig V4 signatures. SeaweedFS defaults to us-east-1.
+	S3Region string `mapstructure:"s3_region"`
 }
 
 // ISOConfig holds ISO/config-drive settings.
@@ -183,8 +195,13 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("s3.iam_file", "/etc/seaweedfs/s3.json")
 	v.SetDefault("s3.weed_s3_service", "weed-s3")
 	v.SetDefault("s3.nginx_blocked_keys_file", "/etc/nginx/conf.d/s3_blocked_keys.conf")
+	v.SetDefault("s3.nginx_access_log", "/var/log/nginx/s3_access.log")
+	v.SetDefault("s3.nginx_audit_log", "/var/log/nginx/s3_audit.log")
 	v.SetDefault("s3.capacity_warn_pct", 80.0)
 	v.SetDefault("s3.capacity_critical_pct", 90.0)
+	v.SetDefault("s3.admin_access_key", "")
+	v.SetDefault("s3.admin_secret_key", "")
+	v.SetDefault("s3.s3_region", "us-east-1")
 
 	v.SetDefault("nats.connection_type", ConnectionTypeNATS)
 	v.SetDefault("nats.url", "nats://localhost:4222")
@@ -219,10 +236,14 @@ func setDefaults(v *viper.Viper) {
 		"vm.shutdown",
 		"full_sync",
 		"bucket_create",
+		"bucket_update",
 		"bucket_delete",
 		"iam_create",
 		"iam_delete",
 		"reconcile",
+		"worm_bucket_create",
+		"worm_bucket_update",
+		"worm_bucket_delete",
 		"s3.cluster.status",
 		"s3.bucket.stats",
 		"s3.iam.list",

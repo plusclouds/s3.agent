@@ -7,10 +7,12 @@ import (
 	"encoding/json"
 	"encoding/xml"
 	"fmt"
+	"io"
 	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"time"
 
 	"go.uber.org/zap"
@@ -43,17 +45,28 @@ func NewManager(cfg config.S3Config, exec *executor.Executor, logger *zap.Logger
 // Bucket operations (S3 API → :8333)
 // ---------------------------------------------------------------------------
 
-// ListBuckets returns the names of all buckets visible on the S3 gateway.
-func (m *Manager) ListBuckets(ctx context.Context) ([]string, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, m.cfg.S3URL+"/", nil)
+// doS3 creates an HTTP request against the S3 gateway, signs it with AWS Sig V4
+// if admin credentials are configured, and executes it.
+func (m *Manager) doS3(ctx context.Context, method, rawURL string, body []byte) (*http.Response, error) {
+	req, err := http.NewRequestWithContext(ctx, method, rawURL, bytes.NewReader(body))
 	if err != nil {
 		return nil, fmt.Errorf("building request: %w", err)
 	}
-	resp, err := m.client.Do(req)
+	signAWSv4(req, m.cfg.AdminAccessKey, m.cfg.AdminSecretKey, m.cfg.S3Region, body)
+	return m.client.Do(req)
+}
+
+// ListBuckets returns the names of all buckets visible on the S3 gateway.
+func (m *Manager) ListBuckets(ctx context.Context) ([]string, error) {
+	resp, err := m.doS3(ctx, http.MethodGet, m.cfg.S3URL+"/", nil)
 	if err != nil {
 		return nil, fmt.Errorf("listing buckets: %w", err)
 	}
 	defer resp.Body.Close()
+
+	if resp.StatusCode >= 300 {
+		return nil, fmt.Errorf("listing buckets: HTTP %d", resp.StatusCode)
+	}
 
 	var result struct {
 		Buckets struct {
@@ -73,17 +86,12 @@ func (m *Manager) ListBuckets(ctx context.Context) ([]string, error) {
 	return names, nil
 }
 
-// CreateBucket creates a bucket on the S3 gateway via a PUT request.
+// CreateBucket creates a bucket on the S3 gateway via a signed PUT request.
 func (m *Manager) CreateBucket(ctx context.Context, spec BucketSpec) error {
 	if spec.Name == "" {
 		return fmt.Errorf("bucket name is required")
 	}
-	url := m.cfg.S3URL + "/" + spec.Name
-	req, err := http.NewRequestWithContext(ctx, http.MethodPut, url, nil)
-	if err != nil {
-		return fmt.Errorf("building request: %w", err)
-	}
-	resp, err := m.client.Do(req)
+	resp, err := m.doS3(ctx, http.MethodPut, m.cfg.S3URL+"/"+spec.Name, nil)
 	if err != nil {
 		return fmt.Errorf("creating bucket %s: %w", spec.Name, err)
 	}
@@ -94,6 +102,157 @@ func (m *Manager) CreateBucket(ctx context.Context, spec BucketSpec) error {
 	}
 
 	m.logger.Info("bucket created", zap.String("bucket", spec.Name))
+	return nil
+}
+
+// UpdateBucket applies updates to an existing bucket. Currently only lifecycle
+// rules are applied; if none are provided the call is a validated no-op.
+func (m *Manager) UpdateBucket(ctx context.Context, spec BucketSpec) error {
+	if spec.Name == "" {
+		return fmt.Errorf("bucket name is required")
+	}
+	if len(spec.LifecycleRules) == 0 {
+		return nil
+	}
+	return m.putLifecycle(ctx, spec.Name, spec.LifecycleRules)
+}
+
+// CreateWORMBucket creates a bucket with S3 Object Lock (WORM) enabled and sets
+// the default retention policy. Object Lock cannot be disabled after creation.
+func (m *Manager) CreateWORMBucket(ctx context.Context, spec WORMBucketSpec) error {
+	if spec.Name == "" {
+		return fmt.Errorf("bucket name is required")
+	}
+	if spec.Mode != "COMPLIANCE" && spec.Mode != "GOVERNANCE" {
+		return fmt.Errorf("object_lock_mode must be COMPLIANCE or GOVERNANCE, got %q", spec.Mode)
+	}
+	if spec.RetentionDays <= 0 {
+		return fmt.Errorf("retention_days must be > 0")
+	}
+
+	rawURL := m.cfg.S3URL + "/" + spec.Name
+	req, err := http.NewRequestWithContext(ctx, http.MethodPut, rawURL, http.NoBody)
+	if err != nil {
+		return fmt.Errorf("building request: %w", err)
+	}
+	req.Header.Set("x-amz-bucket-object-lock-enabled", "true")
+	signAWSv4(req, m.cfg.AdminAccessKey, m.cfg.AdminSecretKey, m.cfg.S3Region, nil)
+
+	resp, err := m.client.Do(req)
+	if err != nil {
+		return fmt.Errorf("creating WORM bucket %s: %w", spec.Name, err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 300 && resp.StatusCode != http.StatusConflict {
+		return fmt.Errorf("creating WORM bucket %s: HTTP %d", spec.Name, resp.StatusCode)
+	}
+
+	if err := m.putObjectLock(ctx, spec.Name, spec.Mode, spec.RetentionDays); err != nil {
+		return err
+	}
+
+	m.logger.Info("WORM bucket created",
+		zap.String("bucket", spec.Name),
+		zap.String("mode", spec.Mode),
+		zap.Int("retention_days", spec.RetentionDays),
+	)
+	return nil
+}
+
+// UpdateWORMBucket updates the default retention policy on an existing WORM bucket.
+// Object Lock mode and retention period can be changed; Object Lock cannot be disabled.
+func (m *Manager) UpdateWORMBucket(ctx context.Context, spec WORMBucketSpec) error {
+	if spec.Name == "" {
+		return fmt.Errorf("bucket name is required")
+	}
+	if spec.Mode != "COMPLIANCE" && spec.Mode != "GOVERNANCE" {
+		return fmt.Errorf("object_lock_mode must be COMPLIANCE or GOVERNANCE, got %q", spec.Mode)
+	}
+	if spec.RetentionDays <= 0 {
+		return fmt.Errorf("retention_days must be > 0")
+	}
+
+	if err := m.putObjectLock(ctx, spec.Name, spec.Mode, spec.RetentionDays); err != nil {
+		return err
+	}
+
+	m.logger.Info("WORM bucket updated",
+		zap.String("bucket", spec.Name),
+		zap.String("mode", spec.Mode),
+		zap.Int("retention_days", spec.RetentionDays),
+	)
+	return nil
+}
+
+// DeleteWORMBucket deletes a WORM bucket. The bucket must be empty — objects
+// within their retention period cannot be deleted (COMPLIANCE) or require
+// bypass permission (GOVERNANCE). No force-empty is attempted.
+func (m *Manager) DeleteWORMBucket(ctx context.Context, name string) error {
+	if name == "" {
+		return fmt.Errorf("bucket name is required")
+	}
+	resp, err := m.doS3(ctx, http.MethodDelete, m.cfg.S3URL+"/"+name, nil)
+	if err != nil {
+		return fmt.Errorf("deleting WORM bucket %s: %w", name, err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 300 {
+		body, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("deleting WORM bucket %s: HTTP %d: %s", name, resp.StatusCode, body)
+	}
+	m.logger.Info("WORM bucket deleted", zap.String("bucket", name))
+	return nil
+}
+
+// putObjectLock sets the default Object Lock retention configuration on a bucket.
+func (m *Manager) putObjectLock(ctx context.Context, bucket, mode string, days int) error {
+	body := fmt.Sprintf(
+		`<?xml version="1.0" encoding="UTF-8"?>`+
+			`<ObjectLockConfiguration xmlns="http://s3.amazonaws.com/doc/2006-03-01/">`+
+			`<ObjectLockEnabled>Enabled</ObjectLockEnabled>`+
+			`<Rule><DefaultRetention><Mode>%s</Mode><Days>%d</Days></DefaultRetention></Rule>`+
+			`</ObjectLockConfiguration>`,
+		mode, days,
+	)
+	rawURL := m.cfg.S3URL + "/" + bucket + "?object-lock"
+	resp, err := m.doS3(ctx, http.MethodPut, rawURL, []byte(body))
+	if err != nil {
+		return fmt.Errorf("setting object lock on %s: %w", bucket, err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 300 {
+		respBody, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("setting object lock on %s: HTTP %d: %s", bucket, resp.StatusCode, respBody)
+	}
+	return nil
+}
+
+// putLifecycle sets S3 lifecycle rules on a bucket via the AWS lifecycle API.
+func (m *Manager) putLifecycle(ctx context.Context, bucket string, rules []LifecycleRule) error {
+	var sb strings.Builder
+	sb.WriteString(`<LifecycleConfiguration>`)
+	for i, r := range rules {
+		sb.WriteString(fmt.Sprintf(
+			`<Rule><ID>rule-%d</ID><Filter><Prefix>%s</Prefix></Filter>`+
+				`<Status>Enabled</Status><Expiration><Days>%d</Days></Expiration></Rule>`,
+			i+1, r.Prefix, r.ExpireDays,
+		))
+	}
+	sb.WriteString(`</LifecycleConfiguration>`)
+
+	body := []byte(sb.String())
+	rawURL := m.cfg.S3URL + "/" + bucket + "?lifecycle"
+	resp, err := m.doS3(ctx, http.MethodPut, rawURL, body)
+	if err != nil {
+		return fmt.Errorf("setting lifecycle on %s: %w", bucket, err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode >= 300 {
+		return fmt.Errorf("setting lifecycle on %s: HTTP %d", bucket, resp.StatusCode)
+	}
+
+	m.logger.Info("lifecycle rules applied", zap.String("bucket", bucket), zap.Int("rules", len(rules)))
 	return nil
 }
 
@@ -110,12 +269,7 @@ func (m *Manager) DeleteBucket(ctx context.Context, name string, forceEmpty bool
 		}
 	}
 
-	url := m.cfg.S3URL + "/" + name
-	req, err := http.NewRequestWithContext(ctx, http.MethodDelete, url, nil)
-	if err != nil {
-		return fmt.Errorf("building request: %w", err)
-	}
-	resp, err := m.client.Do(req)
+	resp, err := m.doS3(ctx, http.MethodDelete, m.cfg.S3URL+"/"+name, nil)
 	if err != nil {
 		return fmt.Errorf("deleting bucket %s: %w", name, err)
 	}
@@ -131,12 +285,7 @@ func (m *Manager) DeleteBucket(ctx context.Context, name string, forceEmpty bool
 
 // emptyBucket lists all objects in a bucket and deletes them.
 func (m *Manager) emptyBucket(ctx context.Context, name string) error {
-	url := m.cfg.S3URL + "/" + name + "?list-type=2"
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
-	if err != nil {
-		return err
-	}
-	resp, err := m.client.Do(req)
+	resp, err := m.doS3(ctx, http.MethodGet, m.cfg.S3URL+"/"+name+"?list-type=2", nil)
 	if err != nil {
 		return err
 	}
@@ -152,12 +301,7 @@ func (m *Manager) emptyBucket(ctx context.Context, name string) error {
 	}
 
 	for _, obj := range listResult.Contents {
-		delURL := m.cfg.S3URL + "/" + name + "/" + obj.Key
-		delReq, err := http.NewRequestWithContext(ctx, http.MethodDelete, delURL, nil)
-		if err != nil {
-			return err
-		}
-		delResp, err := m.client.Do(delReq)
+		delResp, err := m.doS3(ctx, http.MethodDelete, m.cfg.S3URL+"/"+name+"/"+obj.Key, nil)
 		if err != nil {
 			return fmt.Errorf("deleting object %s: %w", obj.Key, err)
 		}
@@ -186,7 +330,44 @@ type iamCredential struct {
 	SecretKey string `json:"secretKey"`
 }
 
+// EnsureAdmin ensures the system admin credential (from s3.admin_access_key) exists
+// in s3.json. Called at startup to recover if Reconcile wiped the admin account.
+// No-op when admin_access_key is not configured.
+func (m *Manager) EnsureAdmin() error {
+	if m.cfg.AdminAccessKey == "" {
+		return nil
+	}
+	iam, err := m.readIAM()
+	if err != nil {
+		return fmt.Errorf("reading IAM for admin check: %w", err)
+	}
+	for _, id := range iam.Identities {
+		for _, cred := range id.Credentials {
+			if cred.AccessKey == m.cfg.AdminAccessKey {
+				return nil // already present
+			}
+		}
+	}
+	iam.Identities = append(iam.Identities, iamIdentity{
+		Name:        "plusclouds-s3-admin",
+		Credentials: []iamCredential{{AccessKey: m.cfg.AdminAccessKey, SecretKey: m.cfg.AdminSecretKey}},
+		Actions:     []string{"Admin"},
+	})
+	if err := m.writeIAM(iam); err != nil {
+		return err
+	}
+	m.logger.Info("seeded system admin credential in s3.json")
+	return m.reloadWeedS3()
+}
+
+// isSystemAdmin reports whether the given access key is the reserved system admin.
+func (m *Manager) isSystemAdmin(accessKey string) bool {
+	return m.cfg.AdminAccessKey != "" && accessKey == m.cfg.AdminAccessKey
+}
+
 // ListIAM returns all IAM identities from s3.json with secret keys stripped.
+// The system admin account (admin_access_key) is excluded — it is not managed
+// by the platform.
 func (m *Manager) ListIAM() ([]IAMUser, error) {
 	iam, err := m.readIAM()
 	if err != nil {
@@ -194,14 +375,18 @@ func (m *Manager) ListIAM() ([]IAMUser, error) {
 	}
 	users := make([]IAMUser, 0, len(iam.Identities))
 	for _, id := range iam.Identities {
-		user := IAMUser{
-			Name: id.Name,
-		}
+		accessKey := ""
 		if len(id.Credentials) > 0 {
-			user.AccessKey = id.Credentials[0].AccessKey
-			// SecretKey intentionally omitted
+			accessKey = id.Credentials[0].AccessKey
 		}
-		users = append(users, user)
+		if m.isSystemAdmin(accessKey) {
+			continue // system admin is not platform-managed
+		}
+		users = append(users, IAMUser{
+			Name:      id.Name,
+			AccessKey: accessKey,
+			// SecretKey intentionally omitted
+		})
 	}
 	return users, nil
 }
@@ -305,13 +490,14 @@ func (m *Manager) writeIAM(iam *iamFile) error {
 
 func (m *Manager) reloadWeedS3() error {
 	svc := m.cfg.WeedS3Service
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	_, _, err := m.exec.Execute(ctx, "systemctl", "reload", svc)
+	// weed-s3 has no ExecReload= in its unit; use restart to pick up s3.json changes.
+	_, _, err := m.exec.Execute(ctx, "systemctl", "restart", svc)
 	if err != nil {
-		return fmt.Errorf("reloading %s: %w", svc, err)
+		return fmt.Errorf("restarting %s: %w", svc, err)
 	}
-	m.logger.Info("reloaded SeaweedFS S3 service", zap.String("service", svc))
+	m.logger.Info("restarted SeaweedFS S3 service", zap.String("service", svc))
 	return nil
 }
 
@@ -524,6 +710,9 @@ func (m *Manager) Reconcile(ctx context.Context, desired FullSyncPayload) (*Reco
 // ---------------------------------------------------------------------------
 
 // atomicWrite writes data to path by writing to a temp file and renaming.
+// If path already exists, the temp file inherits its uid/gid so ownership is
+// preserved after the rename (important when the agent runs as root but the
+// target file is owned by a service user, e.g. seaweedfs).
 func atomicWrite(path string, data []byte, perm os.FileMode) error {
 	dir := filepath.Dir(path)
 	tmp, err := os.CreateTemp(dir, ".s3d-write-*")
@@ -539,6 +728,15 @@ func atomicWrite(path string, data []byte, perm os.FileMode) error {
 	if err := tmp.Chmod(perm); err != nil {
 		return fmt.Errorf("chmod temp file: %w", err)
 	}
+
+	// Preserve ownership of the existing file so a service user (e.g. seaweedfs)
+	// can still read the file after it is replaced.
+	if info, err := os.Stat(path); err == nil {
+		if stat, ok := info.Sys().(*syscall.Stat_t); ok {
+			_ = os.Lchown(tmpName, int(stat.Uid), int(stat.Gid))
+		}
+	}
+
 	if _, err := tmp.Write(data); err != nil {
 		return fmt.Errorf("writing temp file: %w", err)
 	}

@@ -129,6 +129,12 @@ func run(_ *cobra.Command, _ []string) error {
 		zap.Duration("heartbeat_interval", cfg.Agent.HeartbeatInterval),
 	)
 
+	// Ensure the system admin credential exists in s3.json so bucket API calls
+	// can be authenticated. Non-fatal if it fails — ops will error individually.
+	if err := s3mgr.EnsureAdmin(); err != nil {
+		logger.Warn("could not ensure S3 admin credential", zap.Error(err))
+	}
+
 	// ------------------------------------------------------------------ //
 	// 6. Connect to NATS
 	// ------------------------------------------------------------------ //

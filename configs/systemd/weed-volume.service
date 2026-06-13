@@ -1,0 +1,24 @@
+[Unit]
+Description=SeaweedFS Volume
+After=weed-master.service
+Requires=weed-master.service
+
+[Service]
+Type=simple
+User=seaweedfs
+Group=seaweedfs
+ExecStart=/usr/local/bin/weed volume \
+  -ip=185.255.172.184 \
+  -port=8080 \
+  -mserver=185.255.172.184:9333 \
+  -dir=/data/seaweedfs/volumes \
+  -max=50 \
+  -minFreeSpacePercent=5
+Restart=on-failure
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=weed-volume
+
+[Install]
+WantedBy=multi-user.target

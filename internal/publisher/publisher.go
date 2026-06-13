@@ -52,13 +52,15 @@ func New(
 	}
 }
 
-// Start launches the heartbeat, telemetry, S3 telemetry, and observer Watch
-// goroutines. They run until ctx is cancelled.
+// Start launches the heartbeat, telemetry, S3 telemetry, audit, and observer
+// Watch goroutines. They run until ctx is cancelled.
 func (p *Publisher) Start(ctx context.Context) {
 	p.sendCapabilities(ctx) //nolint:errcheck
 	go p.heartbeatLoop(ctx)
 	go p.telemetryLoop(ctx)
 	go p.s3TelemetryLoop(ctx)
+	p.s3obs.RunAudit(ctx)
+	go p.auditLoop(ctx)
 	go p.s3obs.Watch(ctx, func(components *s3module.ClusterComponents, reason string) {
 		env, err := protocol.New(p.agentUUID, p.agentType, protocol.TypeS3Health,
 			s3module.S3HealthPayload{
@@ -153,6 +155,45 @@ func (p *Publisher) s3TelemetryLoop(ctx context.Context) {
 	}
 }
 
+// auditLoop drains AuditEvents from the observer and publishes them immediately
+// as TypeS3Audit envelopes. Events arriving together in the same poll window are
+// batched into one envelope to reduce NATS message count.
+func (p *Publisher) auditLoop(ctx context.Context) {
+	if p.s3obs == nil {
+		return
+	}
+	evts := p.s3obs.AuditEvents()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case evt := <-evts:
+			// Drain all events already queued to form a single batch.
+			batch := []s3module.AuditEvent{evt}
+		drain:
+			for {
+				select {
+				case e := <-evts:
+					batch = append(batch, e)
+				default:
+					break drain
+				}
+			}
+			env, err := protocol.New(p.agentUUID, p.agentType, protocol.TypeS3Audit,
+				s3module.S3AuditPayload{Events: batch})
+			if err != nil {
+				p.logger.Warn("s3_audit: build envelope failed", zap.Error(err))
+				continue
+			}
+			if err := p.nats.Publish(env); err != nil {
+				p.logger.Warn("s3_audit: publish failed", zap.Error(err))
+				continue
+			}
+			p.logger.Info("s3_audit published", zap.Int("events", len(batch)))
+		}
+	}
+}
+
 func (p *Publisher) sendHeartbeat(ctx context.Context) {
 	info, err := p.sys.GetInfo(ctx)
 	if err != nil {
@@ -189,13 +230,7 @@ func (p *Publisher) sendTelemetry(ctx context.Context) {
 		p.logger.Warn("telemetry: publish to evt failed", zap.Error(err))
 		return
 	}
-	if err := p.nats.PublishToSubject(p.nats.TelemetrySubject(), env); err != nil {
-		p.logger.Warn("telemetry: publish to vm telemetry subject failed",
-			zap.String("subject", p.nats.TelemetrySubject()),
-			zap.Error(err),
-		)
-	}
-	p.logger.Debug("telemetry published")
+	p.logger.Info("telemetry published")
 }
 
 func (p *Publisher) sendS3Telemetry(ctx context.Context) {
@@ -212,6 +247,7 @@ func (p *Publisher) sendS3Telemetry(ctx context.Context) {
 	payload := s3module.S3TelemetryPayload{
 		Components: *components,
 		Buckets:    buckets,
+		Traffic:    p.s3obs.FlushTraffic(),
 	}
 	env, err := protocol.New(p.agentUUID, p.agentType, protocol.TypeS3Telemetry, payload)
 	if err != nil {
@@ -222,7 +258,7 @@ func (p *Publisher) sendS3Telemetry(ctx context.Context) {
 		p.logger.Warn("s3_telemetry: publish failed", zap.Error(err))
 		return
 	}
-	p.logger.Debug("s3_telemetry published")
+	p.logger.Info("s3_telemetry published")
 }
 
 // operationCatalog is the full schema for every supported operation.

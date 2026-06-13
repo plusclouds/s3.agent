@@ -1,0 +1,22 @@
+[Unit]
+Description=SeaweedFS Filer
+After=weed-master.service
+Requires=weed-master.service
+
+[Service]
+Type=simple
+User=seaweedfs
+Group=seaweedfs
+ExecStart=/usr/local/bin/weed filer \
+  -ip=185.255.172.184 \
+  -port=8888 \
+  -master=185.255.172.184:9333 \
+  -defaultStoreDir=/data/seaweedfs/filer
+Restart=on-failure
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=weed-filer
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,16 @@
+{
+  "identities": [
+    {
+      "name": "plusclouds-s3-admin",
+      "credentials": [
+        {
+          "accessKey": "pcsadmin9e09aeda",
+          "secretKey": "Xfk6VbWcsqCZcGurFRb8XZ0PojyhDZiOgYpjktER"
+        }
+      ],
+      "actions": [
+        "Admin"
+      ]
+    }
+  ]
+}

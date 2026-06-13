@@ -85,10 +85,40 @@ type BucketStat struct {
 	ReplicaHealth string `json:"replica_health"` // "ok" | "degraded"
 }
 
+// TrafficStat holds per-bucket traffic delta for one reporting window.
+// BytesIn counts upload (PUT/POST request body); BytesOut counts download (GET response body).
+// Only 2xx responses are counted.
+type TrafficStat struct {
+	BucketName string `json:"bucket_name"`
+	BytesIn    int64  `json:"bytes_in"`  // upload bytes
+	BytesOut   int64  `json:"bytes_out"` // download bytes
+	Requests   int64  `json:"requests"`  // total 2xx request count
+}
+
+// AuditEvent records a single data-mutation operation detected in the Nginx
+// audit log. Published immediately (within ~500 ms) via TypeS3Audit.
+type AuditEvent struct {
+	Bucket      string     `json:"bucket"`
+	ObjectKey   string     `json:"object_key"`
+	Action      string     `json:"action"`              // "PUT" | "DELETE"
+	SizeBytes   int64      `json:"size_bytes"`          // upload bytes; 0 for DELETE
+	RetainUntil *time.Time `json:"retain_until,omitempty"` // WORM retention expiry if set
+	AccessKey   string     `json:"access_key,omitempty"`   // S3 access key from Authorization header
+	ClientIP    string     `json:"client_ip,omitempty"`
+	PerformedAt time.Time  `json:"performed_at"`
+}
+
+// S3AuditPayload is the envelope payload for TypeS3Audit messages.
+// Events is a batch of all mutations detected in the current poll window.
+type S3AuditPayload struct {
+	Events []AuditEvent `json:"events"`
+}
+
 // S3TelemetryPayload is published every telemetry tick as TypeS3Telemetry.
 type S3TelemetryPayload struct {
 	Components ClusterComponents `json:"components"`
 	Buckets    []BucketStat      `json:"buckets"`
+	Traffic    []TrafficStat     `json:"traffic"` // delta since last tick
 }
 
 // ---------------------------------------------------------------------------
@@ -119,6 +149,20 @@ type BucketSpec struct {
 	OwnerTenantID     string          `json:"owner_tenant_id"`
 	ReplicationFactor int             `json:"replication_factor"`
 	LifecycleRules    []LifecycleRule `json:"lifecycle_rules,omitempty"`
+}
+
+// WORMBucketSpec is the desired state of an Object Lock (WORM) bucket.
+// Object Lock cannot be disabled once enabled on a bucket.
+type WORMBucketSpec struct {
+	BucketID      string `json:"bucket_id"`
+	Name          string `json:"name"`
+	OwnerTenantID string `json:"owner_tenant_id"`
+	// Mode is the default retention mode: "COMPLIANCE" or "GOVERNANCE".
+	// COMPLIANCE: no one (including admin) can delete objects before retention expires.
+	// GOVERNANCE: users with s3:BypassGovernanceRetention can override.
+	Mode          string `json:"mode"`
+	// RetentionDays is the default retention period in days applied to every object written.
+	RetentionDays int    `json:"retention_days"`
 }
 
 // BucketACL is an access control entry tying an IAM user to a bucket.

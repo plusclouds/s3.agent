@@ -1,0 +1,23 @@
+[Unit]
+Description=SeaweedFS Master
+After=network.target
+Wants=network.target
+
+[Service]
+Type=simple
+User=seaweedfs
+Group=seaweedfs
+ExecStart=/usr/local/bin/weed master \
+  -ip=185.255.172.184 \
+  -port=9333 \
+  -mdir=/data/seaweedfs/master \
+  -defaultReplication=000 \
+  -volumeSizeLimitMB=30000
+Restart=on-failure
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=weed-master
+
+[Install]
+WantedBy=multi-user.target

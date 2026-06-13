@@ -21,6 +21,7 @@ const (
 	TypeCapabilities = "capabilities"
 	TypeS3Telemetry  = "s3_telemetry"
 	TypeS3Health     = "s3_health"
+	TypeS3Audit      = "s3_audit"
 )
 
 // Result status constants — used in ResultPayload.Status.

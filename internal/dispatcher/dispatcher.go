@@ -90,6 +90,10 @@ type params struct {
 	LifecycleRules    []s3module.LifecycleRule `json:"lifecycle_rules"`
 	ForceEmpty        bool                    `json:"force_empty"`
 
+	// S3 WORM / Object Lock
+	ObjectLockMode     string `json:"object_lock_mode"`
+	ObjectLockRetentionDays int `json:"retention_days"`
+
 	// S3 IAM
 	AccessKey  string            `json:"access_key"`
 	SecretKey  string            `json:"secret_key"`
@@ -320,7 +324,11 @@ func (d *Dispatcher) run(ctx context.Context, op string, p params) (any, error) 
 		return d.s3obs.PollCluster(ctx)
 
 	case "s3.bucket.stats":
-		return d.s3obs.BucketStats(ctx)
+		stats, err := d.s3obs.BucketStats(ctx)
+		if err != nil {
+			return nil, err
+		}
+		return map[string]any{"buckets": stats, "traffic": d.s3obs.FlushTraffic()}, nil
 
 	// ---- S3: bucket management ----------------------------------------
 	case "bucket_create":
@@ -336,8 +344,51 @@ func (d *Dispatcher) run(ctx context.Context, op string, p params) (any, error) 
 		}
 		return map[string]string{"bucket": p.Name, "status": "created"}, nil
 
+	case "bucket_update":
+		spec := s3module.BucketSpec{
+			BucketID:       p.BucketID,
+			Name:           p.Name,
+			LifecycleRules: p.LifecycleRules,
+		}
+		if err := d.s3mgr.UpdateBucket(ctx, spec); err != nil {
+			return nil, err
+		}
+		return map[string]string{"bucket": p.Name, "status": "updated"}, nil
+
 	case "bucket_delete":
 		if err := d.s3mgr.DeleteBucket(ctx, p.Name, p.ForceEmpty); err != nil {
+			return nil, err
+		}
+		return map[string]string{"bucket": p.Name, "status": "deleted"}, nil
+
+	// ---- S3: WORM / Object Lock bucket management ----------------------
+	case "worm_bucket_create":
+		spec := s3module.WORMBucketSpec{
+			BucketID:      p.BucketID,
+			Name:          p.Name,
+			OwnerTenantID: p.OwnerTenantID,
+			Mode:          p.ObjectLockMode,
+			RetentionDays: p.ObjectLockRetentionDays,
+		}
+		if err := d.s3mgr.CreateWORMBucket(ctx, spec); err != nil {
+			return nil, err
+		}
+		return map[string]string{"bucket": p.Name, "status": "created", "mode": spec.Mode}, nil
+
+	case "worm_bucket_update":
+		spec := s3module.WORMBucketSpec{
+			BucketID:      p.BucketID,
+			Name:          p.Name,
+			Mode:          p.ObjectLockMode,
+			RetentionDays: p.ObjectLockRetentionDays,
+		}
+		if err := d.s3mgr.UpdateWORMBucket(ctx, spec); err != nil {
+			return nil, err
+		}
+		return map[string]string{"bucket": p.Name, "status": "updated", "mode": spec.Mode}, nil
+
+	case "worm_bucket_delete":
+		if err := d.s3mgr.DeleteWORMBucket(ctx, p.Name); err != nil {
 			return nil, err
 		}
 		return map[string]string{"bucket": p.Name, "status": "deleted"}, nil
